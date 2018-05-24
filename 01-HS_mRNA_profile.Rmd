@@ -8,9 +8,6 @@ output:
         toc: true
         toc_depth: 3
 ---
-<style type="text/css">
-h1,h2,h3,h4,h5,h6{color:#00008b}body{font-size:14px}table td{font-size:10px}.dataTables_wrapper,table th{font-size:12px}h1{font-size:40px}h2{font-size:32px}h3{font-size:24px}h4{font-size:20px}h5{font-size:16px}h6{font-size:12px}code.r,pre{font-size:10px}
-</style>
 
 ```{r setup, include=FALSE, warning=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
@@ -111,7 +108,7 @@ The beadarray object is used to calculate detection probabilites
 object.
 
 
-```{r load-idat}
+```{r load-idat, message=FALSE, error=FALSE, results='hide'}
 if(!use_rdata) {
 
     # Create beadarray object
