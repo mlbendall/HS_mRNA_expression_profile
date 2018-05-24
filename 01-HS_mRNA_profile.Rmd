@@ -1,0 +1,505 @@
+---
+title: "Hidradenitis Suppurativa mRNA expression profile analysis"
+author: "Matthew L Bendall"
+date: "5/2/2018"
+output:
+    github_document:
+        html_preview: true
+        toc: true
+        toc_depth: 3
+---
+<style type="text/css">
+h1,h2,h3,h4,h5,h6{color:#00008b}body{font-size:14px}table td{font-size:10px}.dataTables_wrapper,table th{font-size:12px}h1{font-size:40px}h2{font-size:32px}h3{font-size:24px}h4{font-size:20px}h5{font-size:16px}h6{font-size:12px}code.r,pre{font-size:10px}
+</style>
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(xlsx)
+library(pheatmap)
+
+require(limma)
+require(beadarray)
+require(illuminaHumanv4.db)
+require(sva)
+require(statmod)
+
+# Whether or not to use Rdata files (if present)
+use_rdata <- TRUE & file.exists('filedata.Rdata') 
+```
+
+## Data Pre-Processing
+
+
+### Load data paths and sample data
+
+The data directory is named `illumina_data` and is one level above the
+root of this repository (i.e. `../illumina_data`). 
+Within the data directory is the manifest file 
+`HumanHT-12_V4_0_R2_15002873_B.bgx`
+and subdirectories containing `*.idat` files.
+The files are named using Illumina convention:
+`<PLATE_NUM>/<PLATE_NUM>_<POSITION>_Grn.idat`.
+Here we load paths to the data:
+
+```{r load-paths}
+if(!use_rdata) {
+    bgxfile <- '../illumina_data/HumanHT-12_V4_0_R2_15002873_B.bgx'  
+    idat_files <- Sys.glob('../illumina_data/*/*.idat')
+    names(idat_files) <- gsub('_[a-zA-Z\\.]+$', '', basename(idat_files))
+}
+```
+
+Load the patient data from the excel sheet. The file `array_locations.xlsx` 
+contains the Illumina plate number and plate position, which is what we need to
+locate the matching data files.
+
+```{r load-sample-ids}
+if(!use_rdata) {
+    # Levels for groups
+    group_levels <- c('hs','RtoH', 'HtoH', 'RtoR', 'normal')
+    
+    # Plate ID to batch mapping
+    batch_map <- c(
+        "9275888003"='20130301',
+        "9275880036"='20130301',
+        "9275880066"='20130301',
+        "9275880035"='20130301',
+        "9275880064"='20130301',
+        "9249907022"='20130401',
+        "9249907050"='20130401',
+        "9461595097"='20140101',
+        "9440308061"='20140101',
+        "9440308067"='20140101',
+        "3998734065"='20150701',
+        "3998734030"='20150701'
+    )
+    batch_levels <- c('20130301', '20130401', '20140101', '20150701')    
+    
+    samp <- read.xlsx('array_locations.xlsx', 1, 
+                      colClasses='character', stringsAsFactors=F) %>%
+        mutate(
+            group = factor(group, levels=group_levels),
+            batch = factor(batch_map[plate], levels=batch_levels)
+        )
+    row.names(samp) <- paste(samp$plate, samp$position, sep='_')
+
+    all_plates <- row.names(samp)
+}
+```
+
+```{r save-rdata-1, include=F}
+if(!use_rdata) {
+    save(bgxfile, idat_files, all_plates, samp,
+     file='filedata.Rdata')
+} else {
+    load('filedata.Rdata')
+}
+
+# Whether or not to use Rdata files (if present)
+use_rdata <- use_rdata & file.exists('raw_expr.Rdata') 
+```
+
+### Load bead level expression data
+
+Load data from the `*.idat` files.
+We use the functions `beadarray::readIdatFiles` and `limma::read.idat` 
+to read the files and load the data.
+The beadarray object is used to calculate detection probabilites 
+(`beadarray::calculateDetection`) which are then added to a slot on the limma 
+object.
+
+
+```{r load-idat}
+if(!use_rdata) {
+
+    # Create beadarray object
+    raw_beadarray <- beadarray::readIdatFiles(idat_files[all_plates])
+
+    # Create limma object
+    raw_limma <- limma::read.idat(idat_files[all_plates], bgxfile)
+    
+    # Replace column and row names
+    colnames(raw_limma) <- gsub('_Grn', '', basename(colnames(raw_limma)))
+    rownames(raw_limma) <- raw_limma$genes[raw_limma$genes$Array_Address_Id==rownames(raw_limma), 'Probe_Id']
+    
+    # Check that objects have the same ordering for samples
+    stopifnot(all(colnames(raw_limma) == colnames(raw_beadarray)))
+    stopifnot(all(colnames(raw_limma) == all_plates))
+
+    # Detection probabilities
+    det <- beadarray::calculateDetection(raw_beadarray)
+    
+    # Add detection probs to objects
+    Detection(raw_beadarray) <- det
+    raw_limma$other$Detection <- det[rownames(raw_limma),]
+    rm(det)
+}
+```
+
+```{r save-rdata-2, include=F}
+if(!use_rdata) {
+    save(platformSigs, raw_beadarray, raw_limma, file='raw_expr.Rdata')
+} else {
+    load('raw_expr.Rdata')
+}
+
+# Whether or not to use Rdata files (if present)
+use_rdata <- use_rdata & file.exists('norm_expr.Rdata')
+```
+
+### Filtering and Normalization
+
+We perform normexp background correction using negative control probes and
+quantile normalization using negative and positive control probes. This is
+implemented in the `neqc` function of the `limma` package, and is a recommended
+approach for Illumina BeadChips.
+
+```{r norm-neqc}
+if(!use_rdata) {
+    # Normalization
+    norm_limma <- neqc(raw_limma)
+}
+```
+
+We filter probes by two criteria. First is the Illumina probe quality:
+
+> Quality grade assigned to the probe: “Perfect” if it perfectly and uniquely 
+matches the target transcript; “Good” if the probe, although imperfectly 
+matching the target transcript, is still likely to provide considerably 
+sensitive signal (up to two mismatches are allowed, based on empirical evidence 
+that the signal intensity for 50-mer probes with less than 95% identity to the 
+respective targets is less than 50% of the signal associated with perfect 
+matches *); “Bad” if the probe matches repeat sequences, intergenic or intronic
+regions, or is unlikely to provide specific signal for any transcript; 
+“No match” if it does not match any genomic region or transcript.
+
+The other filter criteria is the detection probability, which we calculated
+using the `calculateDetection` function in the `beadarray` package.
+(We calculated this above from the raw expression values). If a probe fails to
+meet the detection threshold (< 0.05) in at least three samples, we consider the
+probe as "not expressed and remove it from analysis.
+
+
+```{r filter-probes}
+if(!use_rdata) {
+    # Filtering
+    # Quality for each probe
+    qual <- unlist(mget(as.character(rownames(norm_limma)),
+                        illuminaHumanv4PROBEQUALITY,
+                        ifnotfound = NA))
+
+    # At least 3 samples are "detected"
+    expressed <- rowSums(norm_limma$other$Detection < 0.05, na.rm=TRUE) >= 3
+    qual[!expressed] <- 'NoExp'
+    table(qual)
+
+    rem <- qual == "No match" | qual == "Bad" | qual == 'NoExp' | is.na(qual)
+    filt_limma <- norm_limma[!rem,]
+    rm(qual,rem)
+}
+```
+
+```{r save-rdata-3, include=F}
+if(!use_rdata) {
+    save(norm_limma, filt_limma, file='norm_expr.Rdata')
+} else {
+    load('norm_expr.Rdata')
+}
+
+# Whether or not to use Rdata files (if present)
+use_rdata <- use_rdata & file.exists('raw_expr.Rdata') 
+```
+
+Create an ExpressionSet object for use with R.
+
+```{r create-expression-set, warning=F}
+if(!use_rdata) {
+    pdata.df <- data.frame(ID=row.names(samp), samp)
+
+    # Create expression set
+    exset.norm <- ExpressionSet(
+        assayData = filt_limma$E,
+        phenoData = AnnotatedDataFrame(
+            droplevels(data.frame(pdata.df, row.names='ID'))
+        )
+    )
+}
+```
+
+```{r save-rdata-4, include=F}
+if(!use_rdata) {
+    save(pdata.df, exset.norm, file='final_expr.Rdata')
+} else {
+    load('final_expr.Rdata')
+}
+
+# Whether or not to use Rdata files (if present)
+use_rdata <- use_rdata & file.exists('final_combat.Rdata') 
+```
+
+### Batch effect correction
+
+#### Principle components analysis, normalized data
+
+We use principle components analysis to identify batch effects. Each sample is
+plotted according to its distance from the other samples. If samples from the
+same batch cluster more closely than samples from the same condition, it
+suggests that batch effects are the source of some of the variance in the data.
+
+```{r calc-pca-norm}
+pc.n <- prcomp(t(exprs(exset.norm)), retx=T, center=T, scale=T)
+# Proportion of variance explained by each component
+pc.n.pov <- (pc.n$sdev^2) / sum(pc.n$sdev^2)
+```
+
+##### PCA plot of normalized data, colored by batch
+
+```{r plot-pca-norm-batch}
+cbind(pData(exset.norm), pc.n$x) %>%
+    ggplot(aes(PC1, PC2)) +
+    geom_point(aes(color=batch)) +
+    xlab(sprintf('PC1 (%.1f%%)', pc.n.pov[1]*100)) +
+    xlab(sprintf('PC2 (%.1f%%)', pc.n.pov[2]*100))
+```
+
+##### PCA plot of normalized data, colored by group
+
+```{r plot-pca-norm-group}
+cbind(pData(exset.norm), pc.n$x) %>%
+    ggplot(aes(PC1, PC2)) +
+    geom_point(aes(color=group)) +
+    xlab(sprintf('PC1 (%.1f%%)', pc.n.pov[1]*100)) +
+    xlab(sprintf('PC2 (%.1f%%)', pc.n.pov[2]*100))
+```
+
+```{r include=F}
+rm(pc.n, pc.n.pov)
+```
+
+From examining these two plots, it appears that samples are clustering by the
+`batch` variable. In particular, the `20150701` and `20130301` batches 
+(in purple and orange) appear distinct. Based on this we will use the ComBat
+method for batch correction.
+
+
+### ComBat adjustment
+
+ComBat allows users to adjust for batch effects in datasets where the batch 
+covariate is known, using methodology described in Johnson et al. 2007. It uses
+either parametric or non-parametric empirical Bayes frameworks for adjusting 
+data for batch effects. Users are returned an expression matrix that has been
+corrected for batch effects. The input data are assumed to be cleaned and 
+normalized before batch effect removal.
+
+```{r run-combat}
+if(!use_rdata) {
+    mod <- model.matrix(~ group, data=pData(exset.norm))
+    tmp.exprs <- ComBat(dat=exprs(exset.norm), batch=pData(exset.norm)$batch, mod=mod,
+                        par.prior=TRUE, prior.plots=FALSE)
+
+    # Create expression set
+    exset.combat <- ExpressionSet(
+        assayData = tmp.exprs,
+        phenoData = phenoData(exset.norm)
+    )
+}
+```
+
+```{r save-rdata-5, include=F}
+if(!use_rdata) {
+    save(pdata.df, exset.combat, file='final_combat.Rdata')
+} else {
+    load('final_combat.Rdata')
+}
+
+# Whether or not to use Rdata files (if present)
+use_rdata <- use_rdata & file.exists('final_combat.Rdata') 
+```
+
+```{r include=F}
+rm(tmp.exprs)
+```
+
+### Principle components analysis, adjusted data
+
+```{r calc-pca-combat}
+pc.c <- prcomp(t(exprs(exset.combat)), retx=T, center=T, scale=T)
+# Proportion of variance explained by each component
+pc.c.pov <- (pc.c$sdev^2) / sum(pc.c$sdev^2)
+```
+
+##### PCA plot of adjusted data, colored by batch
+
+```{r plot-pca-combat-batch}
+cbind(pData(exset.combat), pc.c$x) %>%
+    ggplot(aes(PC1, PC2)) +
+    geom_point(aes(color=batch)) +
+    xlab(sprintf('PC1 (%.1f%%)', pc.c.pov[1]*100)) +
+    xlab(sprintf('PC2 (%.1f%%)', pc.c.pov[2]*100))
+```
+
+
+##### PCA plot of adjusted data, colored by group
+
+```{r plot-pca-combat-group}
+cbind(pData(exset.combat), pc.c$x) %>%
+    ggplot(aes(PC1, PC2)) +
+    geom_point(aes(color=group)) +
+    xlab(sprintf('PC1 (%.1f%%)', pc.c.pov[1]*100)) +
+    xlab(sprintf('PC2 (%.1f%%)', pc.c.pov[2]*100))
+```
+
+```{r include=F}
+rm(pc.c, pc.c.pov)
+```
+
+The batches do not appear to be distinct. We will move forward with the
+corrected expression data.
+
+## Hidradenitis Suppurativa mRNA expression profile analysis
+
+Set default values and load data.
+
+```{r de-defaults}
+# False Discovery Rate
+fdr_level <- 0.05
+
+# Log Fold Change cutoff
+lfc_cutoff <- 1
+
+# Mapping of probe names to symbols
+probe2sym <- as.list(illuminaHumanv4SYMBOL[mappedkeys(illuminaHumanv4SYMBOL)])
+
+load('final_combat.Rdata')
+# Use the ComBat adjusted values
+exset <- exset.combat
+
+glevels <- c('hs', 'normal')
+sel <- pData(exset)$group %in% glevels
+cur <- exset[,sel]
+
+# Relevel "group" variable
+phenoData(cur)$group <- factor(phenoData(cur)$group, levels=glevels)
+
+```
+
+
+### Linear model
+
+We have 2 groups of patients:
+    
++  *hs* - Patients with Hidradenitis suppurativa
++  *normal* - Normal controls from skin graft
+
+The linear model we use contains one independent variable, `group` with two
+levels: `hs` and `normal`. The contrast we are interested in is 
+`hs - normal`.
+
+
+```{r hs-fit, warning=F}
+design <- model.matrix(~0 + group, data=pData(cur))
+colnames(design) <- gsub('group', '', colnames(design))
+cont.matrix <- makeContrasts(hs..normal = hs - normal,
+                             levels=design)
+
+fit <- lmFit(cur, design)
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2, trend=TRUE, robust=TRUE)
+```
+
+### Test for DE genes 
+
+Next we test for differentially expressed genes. DE genes have a false discovery
+rate `r sprintf('FDR < %.3f', fdr_level)` and have absolute log2-fold change
+greater than or equal to `r sprintf('abs(logFC) >= %.3f', lfc_cutoff)`.
+(This log2-fold cutoff is equivalent to `r sprintf('%.1fx', 2^lfc_cutoff)`
+changes).
+
+```{r hs-results}
+results <- decideTests(fit2, method="separate", adjust.method="BH",
+                       p.value=fdr_level, lfc=lfc_cutoff)
+summary(results)
+```
+
+Found `r summary(results)["-1",]` genes that are underexpressed in HS patients
+and `r summary(results)["1",]` genes that are overexpressed in HS patients.
+
+### Principle Component Analysis
+
+**NOTE**: This analysis only uses genes that meet our criteria.
+
+```{r hs-pca-plot}
+pc.1 <- prcomp(t(exprs(cur)[results@.Data != 0, ]), retx=T, center=T, scale=T)
+pc.1.pov <- (pc.1$sdev^2) / sum(pc.1$sdev^2)
+
+cbind(pData(cur), pc.1$x) %>%
+    ggplot(aes(PC1, PC2)) +
+    geom_point(aes(color=group)) +
+    geom_text(aes(label=paste(plate, position, sep='_'), color=group), hjust=0, nudge_x=2, size=3) +
+    xlab(sprintf('PC1 (%.1f%%)', pc.1.pov[1]*100)) +
+    ylab(sprintf('PC2 (%.1f%%)', pc.1.pov[2]*100))
+```
+
+```{r include=F}
+rm(pc.1, pc.1.pov)
+```
+
+### Top DE Genes
+
+Heatmap showing 25 signficantly DE genes with the greatest absolute fold change
+between `hs` and `normal` samples.
+
+```{r hs-heatmap}
+tt <- topTable(fit2, adjust='BH', n=25, p.value=fdr_level, sort.by='logFC')
+
+hm.rownames <- sapply(row.names(tt), function(p) {
+    if(p %in% names(probe2sym)) unlist(probe2sym[p]) else p
+})
+names(hm.rownames) <- row.names(tt)
+
+pdf('figure1.pdf', paper='letter', onefile=FALSE)
+pheatmap(as.matrix(exprs(cur)[row.names(tt),]),
+         border_color = NA,
+         clustering_distance_rows='euclidean',
+         clustering_distance_cols='euclidean',
+         clustering_method = 'ward.D2',
+         annotation_col=pData(cur)[,c('group','batch')],
+         labels_row=hm.rownames, fontsize_row=7
+)
+dev.off()
+
+pheatmap(as.matrix(exprs(cur)[row.names(tt),]),
+         border_color = NA,
+         clustering_distance_rows='euclidean',
+         clustering_distance_cols='euclidean',
+         clustering_method = 'ward.D2',
+         annotation_col=pData(cur)[,c('group','batch')],
+         labels_row=hm.rownames, fontsize_row=7
+)
+
+```
+
+```{r include=F}
+rm(tt, hm.rownames)
+```
+
+### Create IPA output table
+
+Output **all** significantly DE genes to an excel file for use in IPA. We do 
+**not** use a cutoff for LFC here since this can be done in downstream analysis.
+
+```{r hs-table-ipa, warning=FALSE}
+topTable(fit2, coef='hs..normal', adjust='BH', n=Inf, p.value=fdr_level) %>%
+    tibble::rownames_to_column(var='Probe') %>%
+    dplyr::select(Probe, adj.P.Val, logFC, AveExpr) %>%
+    dplyr::arrange(logFC) %>% data.frame %>%
+    write.xlsx(file='hs_normal.ipa.xlsx', col.names=T, row.names=F)
+```
+
+```{r include=F}
+rm(glevels, sel, cur, design, cont.matrix, fit, fit2, results)
+```
+
+
